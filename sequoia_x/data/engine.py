@@ -1,14 +1,11 @@
 """数据引擎模块：基于本地 Parquet 和因子表实现动态前复权（QFQ）高速行情检索。"""
 
 import configparser
-from datetime import datetime
-import os
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
 
 import duckdb
-import numpy as np
 import pandas as pd
 
 from sequoia_x.core.config import Settings
@@ -50,6 +47,7 @@ class DataEngine:
 
     def _load_factors_from_pg(self) -> pd.DataFrame:
         """从 Postgres 数据库加载因子表。"""
+        engine = None
         try:
             from sqlalchemy import create_engine, text
 
@@ -84,6 +82,9 @@ class DataEngine:
         except Exception as e:
             logger.error(f"从 Postgres 读取因子失败: {e}")
             return pd.DataFrame()
+        finally:
+            if engine is not None:
+                engine.dispose()
 
     def get_all_symbols(self) -> list[str]:
         """获取全市场所有股票代码列表。"""
@@ -130,10 +131,10 @@ class DataEngine:
                     volume,
                     amount as turnover
                 FROM '{parquet_pattern}'
-                WHERE date >= '{self.start_date}'
+                WHERE date >= ?
                 ORDER BY date ASC
             """
-            df_raw = duckdb.query(sql).df()
+            df_raw = duckdb.execute(sql, [self.start_date]).df()
             if df_raw.empty:
                 self._all_ohlcv_cache = {}
                 return
@@ -198,10 +199,10 @@ class DataEngine:
                     volume,
                     amount as turnover
                 FROM '{parquet_pattern}'
-                WHERE code = '{symbol}' AND date >= '{self.start_date}'
+                WHERE code = ? AND date >= ?
                 ORDER BY date ASC
             """
-            df_raw = duckdb.query(sql).df()
+            df_raw = duckdb.execute(sql, [symbol, self.start_date]).df()
         except Exception as e:
             logger.error(f"[{symbol}] 读取 Parquet 失败: {e}")
             return pd.DataFrame()

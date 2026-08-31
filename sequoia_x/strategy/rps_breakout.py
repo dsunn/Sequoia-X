@@ -1,5 +1,4 @@
 import pandas as pd
-import sqlite3
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.core.logger import get_logger
 
@@ -7,7 +6,7 @@ logger = get_logger(__name__)
 
 
 class RpsBreakoutStrategy(BaseStrategy):
-    """RPS 极强动量突破策略"""
+    """RPS 极强动量突破策略（使用全市场前复权 QFQ 行情数据）。"""
 
     webhook_key: str = "rps"
     rps_period: int = 120
@@ -15,9 +14,12 @@ class RpsBreakoutStrategy(BaseStrategy):
 
     def run(self) -> list[str]:
         try:
-            parquet_pattern = str(self.engine.parquet_dir / "*.parquet")
-            import duckdb
-            df = duckdb.query(f"SELECT code as symbol, date, close, high FROM '{parquet_pattern}' WHERE date >= '{self.engine.start_date}'").df()
+            self.engine._preload_ohlcv_if_needed()
+            if not self.engine._all_ohlcv_cache:
+                return []
+
+            # 汇总全市场前复权缓存
+            df = pd.concat(self.engine._all_ohlcv_cache.values(), ignore_index=True)
         except Exception as exc:
             logger.error(f"读取行情数据失败: {exc}")
             return []
