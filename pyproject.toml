@@ -10,6 +10,10 @@ dependencies = [
     "rich>=13.0",
     "pandas>=2.0",
     "requests>=2.31",
+    "duckdb>=1.5.5",
+    "pyarrow>=25.0.1",
+    "psycopg2-binary>=2.9.12",
+    "sqlalchemy>=2.0.52",
 ]
 
 [project.optional-dependencies]

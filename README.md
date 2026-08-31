@@ -7,18 +7,16 @@
 ## 简介 | Introduction
 
 Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python 工程化标准从零重构。
-系统以 OOP 架构、向量化计算和增量数据更新为核心设计原则，每日收盘后自动选股并推送至飞书群。
+系统以 OOP 架构、向量化计算为核心设计原则，每日收盘后自动选股并推送至飞书群。
 
-数据层使用 [baostock](http://baostock.com)（免费、无需注册、无限流）拉取历史及增量日 K 数据（后复权），
-存储于本地 SQLite，彻底规避东方财富反爬问题。
+数据层直接对接本地分卷 **Parquet**（`~/python/backtest/data/candles/*.parquet`）与**因子表**（`adjustment_factors.parquet` 或 Postgres 数据库），通过 DuckDB 高性能引擎实现动态**前复权（QFQ）**，全市场检索速度大幅跃升至秒级。
 
 ---
 
-## 两种运行模式
+## 运行方式
 
 ```bash
-python main.py               # 日常模式：8进程增量补数据 + 跑策略 + 飞书推送（2~3分钟）
-python main.py --backfill     # 回填模式：全市场历史K线一次性灌入（约12分钟）
+python main.py               # 全市场策略选股 + 飞书推送
 ```
 
 ---

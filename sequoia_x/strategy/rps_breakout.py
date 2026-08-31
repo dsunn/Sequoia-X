@@ -15,10 +15,11 @@ class RpsBreakoutStrategy(BaseStrategy):
 
     def run(self) -> list[str]:
         try:
-            with sqlite3.connect(self.engine.db_path) as conn:
-                df = pd.read_sql("SELECT symbol, date, close, high FROM stock_daily", conn)
+            parquet_pattern = str(self.engine.parquet_dir / "*.parquet")
+            import duckdb
+            df = duckdb.query(f"SELECT code as symbol, date, close, high FROM '{parquet_pattern}' WHERE date >= '{self.engine.start_date}'").df()
         except Exception as exc:
-            logger.error(f"读取数据库失败: {exc}")
+            logger.error(f"读取行情数据失败: {exc}")
             return []
 
         if df.empty:

@@ -57,10 +57,9 @@ def main() -> None:
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
-        # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
-        logger.info("开始拉取最新快照...")
+        # ── 选股模式：从本地 Parquet + 因子表读取前复权数据并执行策略 ──
         count = engine.sync_today_bulk()
-        logger.info(f"快照同步完成，写入 {count} 只股票")
+        logger.info(f"数据引擎就绪，涵盖 {count} 只标的，开始执行策略计算...")
 
         # 4. 策略列表（新增策略在此追加即可）
         strategies: list[BaseStrategy] = [

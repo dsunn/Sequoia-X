@@ -1,8 +1,14 @@
-"""数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
+"""数据引擎模块：基于本地 Parquet 和因子表实现动态前复权（QFQ）高速行情检索。"""
 
-import sqlite3
+import configparser
+from datetime import datetime
+import os
 from pathlib import Path
+from typing import Optional
+from urllib.parse import quote_plus
 
+import duckdb
+import numpy as np
 import pandas as pd
 
 from sequoia_x.core.config import Settings
@@ -11,323 +17,254 @@ from sequoia_x.core.logger import get_logger
 logger = get_logger(__name__)
 
 
-_CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS stock_daily (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol   TEXT    NOT NULL,
-    date     TEXT    NOT NULL,
-    open     REAL,
-    high     REAL,
-    low      REAL,
-    close    REAL,
-    volume   REAL,
-    turnover REAL,
-    UNIQUE (symbol, date)
-);
-"""
-
-_CREATE_INDEX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
-"""
-
-
-def _bs_fetch_batch(tasks: list) -> list:
-    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
-    import baostock as bs
-    bs.login()
-    results = []
-    for symbol, bs_code, start, end in tasks:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="d",
-            adjustflag="1",  # 后复权
-        )
-        if rs.error_code != "0":
-            continue
-        while rs.next():
-            results.append([symbol] + rs.get_row_data())
-    bs.logout()
-    return results
-
-
 class DataEngine:
-    """行情数据引擎，负责 SQLite 存储和 baostock 数据同步。"""
+    """行情数据引擎：负责从本地 Parquet 和因子表读取并动态计算前复权 OHLCV。"""
 
     def __init__(self, settings: Settings) -> None:
-        self.db_path: str = settings.db_path
+        self.settings = settings
+        self.parquet_dir: Path = Path(settings.parquet_dir)
+        self.factors_path: Path = Path(settings.factors_path)
         self.start_date: str = settings.start_date
-        self._init_db()
 
-    def _init_db(self) -> None:
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(_CREATE_TABLE_SQL)
-            conn.execute(_CREATE_INDEX_SQL)
-            conn.commit()
-        logger.info(f"数据库初始化完成：{self.db_path}")
+        self._factors_df: Optional[pd.DataFrame] = None
+        self._symbols_cache: Optional[list[str]] = None
+        self._all_ohlcv_cache: Optional[dict[str, pd.DataFrame]] = None
 
-    def _get_last_date(self, symbol: str) -> str | None:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT MAX(date) FROM stock_daily WHERE symbol = ?",
-                (symbol,),
-            ).fetchone()
-        return row[0] if row and row[0] else None
+    def _get_factors_df(self) -> pd.DataFrame:
+        """加载因子表（全市场因子约 1.3MB，缓存到内存）。"""
+        if self._factors_df is not None:
+            return self._factors_df
 
-    def get_ohlcv(self, symbol: str) -> pd.DataFrame:
-        with sqlite3.connect(self.db_path) as conn:
-            df = pd.read_sql(
-                "SELECT * FROM stock_daily WHERE symbol = ? ORDER BY date",
-                conn,
-                params=(symbol,),
-            )
-        return df
+        if self.factors_path.exists():
+            df = pd.read_parquet(self.factors_path)
+        else:
+            df = self._load_factors_from_pg()
 
-    @staticmethod
-    def _to_baostock_code(symbol: str) -> str:
-        """将纯数字代码转为 baostock 格式：6/9开头 -> sh，其余 -> sz。"""
-        prefix = "sh" if symbol.startswith(("6", "9")) else "sz"
-        return f"{prefix}.{symbol}"
+        if not df.empty:
+            df["code"] = df["code"].astype(str).str.zfill(6)
+            df["date"] = pd.to_datetime(df["date"]).dt.normalize().astype("datetime64[us]")
+            df = df.sort_values(["code", "date"]).reset_index(drop=True)
 
-    # ── 数据同步 ──
+        self._factors_df = df
+        return self._factors_df
 
-    def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
-        from datetime import date, timedelta
-        from multiprocessing import Pool
-
-        today_str = date.today().strftime("%Y-%m-%d")
-
-        tasks = []
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
-            ).fetchall()
-
-        if not rows:
-            logger.warning("本地无股票数据，请先执行 --backfill")
-            return 0
-
-        for symbol, last_date in rows:
-            if last_date and last_date >= today_str:
-                continue
-            start = today_str
-            if last_date:
-                start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
-            tasks.append((symbol, self._to_baostock_code(symbol), start, today_str))
-
-        if not tasks:
-            logger.info("所有股票已是最新，无需更新")
-            return 0
-
-        logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
-
-        n_workers = min(8, len(tasks))
-        chunks = [tasks[i::n_workers] for i in range(n_workers)]
-
-        with Pool(n_workers) as pool:
-            batch_results = pool.map(_bs_fetch_batch, chunks)
-
-        all_rows = []
-        for batch in batch_results:
-            all_rows.extend(batch)
-
-        if not all_rows:
-            logger.info("无新数据（可能非交易日）")
-            return 0
-
-        df = pd.DataFrame(all_rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"])
-        for col in ["open", "high", "low", "close", "volume", "turnover"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"])
-        df = df[df["volume"] > 0]
-
-        count = len(df)
-        with sqlite3.connect(self.db_path) as conn:
-            for d in df["date"].unique().tolist():
-                conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
-            conn.commit()
-
-        logger.info(f"sync_today_bulk: 写入 {count} 条数据")
-        return count
-
-    def backfill(self, symbols: list[str]) -> None:
-        """通过 baostock 批量回填历史日 K 线数据（后复权）。
-
-        容错机制：
-        - 单只股票失败自动重试 3 次，间隔递增（2s/4s/8s）
-        - 每 200 只股票自动重连 baostock（防止长连接超时）
-        - 已入库的自动 skip，中断后可重跑续传
-        """
-        import time
-        from datetime import date, timedelta
-
-        import baostock as bs
-
-        today_str = date.today().strftime("%Y-%m-%d")
-        max_retries = 3
-        reconnect_interval = 200  # 每处理 N 只股票重连一次
-
-        def _login():
-            lg = bs.login()
-            if lg.error_code != "0":
-                logger.error(f"baostock 登录失败: {lg.error_msg}")
-                return False
-            return True
-
-        if not _login():
-            return
-
-        success = 0
-        skipped = 0
-        failed = 0
-        since_reconnect = 0
-
+    def _load_factors_from_pg(self) -> pd.DataFrame:
+        """从 Postgres 数据库加载因子表。"""
         try:
-            for i, symbol in enumerate(symbols):
-                last_date = self._get_last_date(symbol)
-                if last_date and last_date >= today_str:
-                    skipped += 1
-                    if (i + 1) % 500 == 0:
-                        logger.info(
-                            f"已处理 {i + 1}/{len(symbols)}，"
-                            f"成功 {success} 跳过 {skipped} 失败 {failed}"
-                        )
-                    continue
+            from sqlalchemy import create_engine, text
 
-                # 定期重连，防止长连接超时
-                since_reconnect += 1
-                if since_reconnect >= reconnect_interval:
-                    bs.logout()
-                    time.sleep(1)
-                    if not _login():
-                        logger.error("重连失败，终止回填")
-                        return
-                    since_reconnect = 0
+            db_ini = Path(self.settings.db_config_path)
+            if not db_ini.exists():
+                logger.warning(f"Database config not found: {db_ini}")
+                return pd.DataFrame()
 
-                start = last_date or self.start_date
-                if last_date:
-                    start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
+            parser = configparser.ConfigParser()
+            parser.read(db_ini)
+            section = self.settings.pg_section
+            if not parser.has_section(section):
+                logger.warning(f"Section [{section}] not found in {db_ini}")
+                return pd.DataFrame()
 
-                bs_code = self._to_baostock_code(symbol)
+            user = parser.get(section, "user").strip()
+            password = parser.get(section, "password", fallback="").strip()
+            host = parser.get(section, "host").strip()
+            port = parser.get(section, "port", fallback="5432").strip()
+            database = parser.get(section, "database", fallback=parser.get(section, "dbname", fallback="")).strip()
 
-                # 带重试的查询
-                rows = []
-                query_ok = False
-                for attempt in range(max_retries):
-                    try:
-                        rs = bs.query_history_k_data_plus(
-                            bs_code,
-                            "date,open,high,low,close,volume,amount",
-                            start_date=start,
-                            end_date=today_str,
-                            frequency="d",
-                            adjustflag="1",  # 后复权
-                        )
+            auth = quote_plus(user)
+            if password:
+                auth = f"{auth}:{quote_plus(password)}"
+            url = f"postgresql://{auth}@{host}:{port}/{database}"
 
-                        if rs.error_code != "0":
-                            raise RuntimeError(rs.error_msg)
-
-                        rows = []
-                        while rs.next():
-                            rows.append(rs.get_row_data())
-                        query_ok = True
-                        break
-
-                    except Exception as exc:
-                        if attempt < max_retries - 1:
-                            wait = 2 ** (attempt + 1)
-                            logger.warning(
-                                f"[{symbol}] 第{attempt + 1}次失败: {exc}，{wait}s 后重试"
-                            )
-                            time.sleep(wait)
-                            # 重连 baostock
-                            bs.logout()
-                            time.sleep(1)
-                            _login()
-                        else:
-                            logger.warning(f"[{symbol}] {max_retries}次重试均失败，跳过")
-
-                if not query_ok:
-                    failed += 1
-                    continue
-
-                if not rows:
-                    skipped += 1
-                    continue
-
-                df = pd.DataFrame(rows, columns=rs.fields)
-                for col in ["open", "high", "low", "close", "volume", "amount"]:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                df = df.dropna(subset=["close"])
-                df = df[df["volume"] > 0]
-
-                if df.empty:
-                    skipped += 1
-                    continue
-
-                df["symbol"] = symbol
-                df = df.rename(columns={"amount": "turnover"})
-                df = df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]]
-
-                try:
-                    with sqlite3.connect(self.db_path) as conn:
-                        df.to_sql(
-                            "stock_daily", conn, if_exists="append",
-                            index=False, method="multi", chunksize=500,
-                        )
-                except sqlite3.IntegrityError:
-                    pass
-
-                success += 1
-
-                if (i + 1) % 500 == 0:
-                    logger.info(
-                        f"已处理 {i + 1}/{len(symbols)}，"
-                        f"成功 {success} 跳过 {skipped} 失败 {failed}"
-                    )
-
-        finally:
-            bs.logout()
-
-        logger.info(f"回填完成 — 成功: {success} | 跳过: {skipped} | 失败: {failed}")
-
-    # ── 股票列表 ──
+            engine = create_engine(url)
+            sql = text("SELECT code, date, qfq_factor FROM public.stock_adjustment_factors ORDER BY code, date ASC")
+            with engine.connect() as conn:
+                df = pd.read_sql(sql, conn)
+            return df
+        except Exception as e:
+            logger.error(f"从 Postgres 读取因子失败: {e}")
+            return pd.DataFrame()
 
     def get_all_symbols(self) -> list[str]:
-        """通过 baostock 获取全市场 A 股代码列表。"""
-        import baostock as bs
+        """获取全市场所有股票代码列表。"""
+        if self._symbols_cache is not None:
+            return self._symbols_cache
 
-        lg = bs.login()
-        if lg.error_code != "0":
-            logger.error(f"baostock 登录失败: {lg.error_msg}")
+        parquet_files = sorted(self.parquet_dir.glob("*.parquet"))
+        if not parquet_files:
+            logger.warning(f"未在 {self.parquet_dir} 找到 parquet 数据文件")
             return []
 
+        # 优先读取最新年份的 parquet 提取股票代码
+        latest_file = str(parquet_files[-1])
         try:
-            rs = bs.query_stock_basic(code_name="", code="")
-            symbols = []
-            while rs.next():
-                row = rs.get_row_data()
-                code = row[0]           # "sh.600000" or "sz.000001"
-                status = row[4]         # "1" = 上市
-                stock_type = row[5]     # "1" = 股票
-                if status == "1" and stock_type == "1":
-                    symbols.append(code.split(".")[1])  # 提取纯数字代码
-            logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
-            return symbols
+            symbols = duckdb.query(
+                f"SELECT DISTINCT code FROM '{latest_file}' ORDER BY code"
+            ).fetchall()
+            self._symbols_cache = [str(r[0]).zfill(6) for r in symbols]
         except Exception as e:
-            logger.error(f"获取股票列表失败: {e}")
-            return []
-        finally:
-            bs.logout()
+            logger.error(f"提取股票列表失败: {e}")
+            self._symbols_cache = []
+
+        return self._symbols_cache
 
     def get_local_symbols(self) -> list[str]:
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT symbol FROM stock_daily"
-            ).fetchall()
-        return [row[0] for row in rows]
+        """获取本地已有数据的股票代码列表（与 get_all_symbols 等价）。"""
+        return self.get_all_symbols()
+
+    def _preload_ohlcv_if_needed(self) -> None:
+        """一次性加载全市场数据并完成全局向量化前复权（QFQ），毫秒级供各策略查询。"""
+        if self._all_ohlcv_cache is not None:
+            return
+
+        parquet_pattern = str(self.parquet_dir / "*.parquet")
+        try:
+            sql = f"""
+                SELECT
+                    code as symbol,
+                    date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    amount as turnover
+                FROM '{parquet_pattern}'
+                WHERE date >= '{self.start_date}'
+                ORDER BY date ASC
+            """
+            df_raw = duckdb.query(sql).df()
+            if df_raw.empty:
+                self._all_ohlcv_cache = {}
+                return
+
+            df_raw["symbol"] = df_raw["symbol"].astype(str).str.zfill(6)
+            df_raw["date"] = pd.to_datetime(df_raw["date"]).dt.normalize().astype("datetime64[us]")
+            df_raw = df_raw.sort_values("date").reset_index(drop=True)
+
+            # 获取因子表
+            df_factors = self._get_factors_df()
+            if not df_factors.empty and "qfq_factor" in df_factors.columns:
+                df_factors_sorted = df_factors.sort_values("date").reset_index(drop=True)
+                df_merged = pd.merge_asof(
+                    df_raw,
+                    df_factors_sorted[["code", "date", "qfq_factor"]],
+                    on="date",
+                    left_by="symbol",
+                    right_by="code",
+                    direction="backward",
+                )
+                df_merged["qfq_factor"] = df_merged.groupby("symbol")["qfq_factor"].ffill().bfill().fillna(1.0)
+                f = df_merged["qfq_factor"].replace(0, 1.0)
+                for col in ["open", "high", "low", "close"]:
+                    df_merged[col] = (df_merged[col] / f).round(3)
+                df_merged["volume"] = (df_merged["volume"] * f).round(0)
+                df_all = df_merged
+            else:
+                df_all = df_raw
+
+            df_all["date"] = df_all["date"].dt.strftime("%Y-%m-%d")
+            self._all_ohlcv_cache = {
+                symbol: grp.sort_values("date").reset_index(drop=True)
+                for symbol, grp in df_all.groupby("symbol")
+            }
+            logger.info(f"全市场数据与前复权加载完成，共缓存 {len(self._all_ohlcv_cache)} 只股票")
+        except Exception as e:
+            logger.error(f"预加载全市场数据失败: {e}")
+            self._all_ohlcv_cache = {}
+
+    def get_ohlcv(self, symbol: str) -> pd.DataFrame:
+        """获取单只股票的前复权（QFQ）历史日 K 线数据。
+
+        Returns:
+            DataFrame 包含列: ['symbol', 'date', 'open', 'high', 'low', 'close', 'volume', 'turnover']
+        """
+        symbol = str(symbol).zfill(6)
+        self._preload_ohlcv_if_needed()
+
+        if self._all_ohlcv_cache is not None and symbol in self._all_ohlcv_cache:
+            return self._all_ohlcv_cache[symbol]
+
+        parquet_pattern = str(self.parquet_dir / "*.parquet")
+        try:
+            sql = f"""
+                SELECT
+                    code as symbol,
+                    date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    amount as turnover
+                FROM '{parquet_pattern}'
+                WHERE code = '{symbol}' AND date >= '{self.start_date}'
+                ORDER BY date ASC
+            """
+            df_raw = duckdb.query(sql).df()
+        except Exception as e:
+            logger.error(f"[{symbol}] 读取 Parquet 失败: {e}")
+            return pd.DataFrame()
+
+        if df_raw.empty:
+            return df_raw
+
+        return self.apply_qfq(df_raw, symbol)
+
+    def apply_qfq(self, df_raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """应用前复权计算。
+
+        公式：
+          前复权价格 = 原始价格 / qfq_factor
+          成交量 = 原始成交量 * qfq_factor
+        """
+        if df_raw.empty:
+            return df_raw
+
+        df = df_raw.copy()
+        df["symbol"] = df["symbol"].astype(str).str.zfill(6)
+
+        df_factors = self._get_factors_df()
+        if df_factors.empty or "qfq_factor" not in df_factors.columns:
+            return df
+
+        stock_factors = df_factors[df_factors["code"] == symbol]
+        if stock_factors.empty:
+            return df
+
+        df["date"] = pd.to_datetime(df["date"]).dt.normalize().astype("datetime64[us]")
+        df = df.sort_values("date").reset_index(drop=True)
+
+        stock_factors = stock_factors.copy()
+        stock_factors["date"] = pd.to_datetime(stock_factors["date"]).dt.normalize().astype("datetime64[us]")
+        stock_factors = stock_factors.sort_values("date").reset_index(drop=True)
+
+        df = pd.merge_asof(
+            df,
+            stock_factors[["date", "qfq_factor"]],
+            on="date",
+            direction="backward",
+        )
+        df["qfq_factor"] = df["qfq_factor"].ffill().bfill().fillna(1.0)
+
+        f = df["qfq_factor"].replace(0, 1.0)
+        for col in ["open", "high", "low", "close"]:
+            if col in df.columns:
+                df[col] = (df[col] / f).round(3)
+
+        if "volume" in df.columns:
+            df["volume"] = (df["volume"] * f).round(0)
+
+        df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+        return df
+
+    def sync_today_bulk(self) -> int:
+        """盘后/日常数据同步状态检查。"""
+        symbols = self.get_all_symbols()
+        logger.info(f"Parquet 数据源已就绪，当前市场涵盖 {len(symbols)} 只股票")
+        return len(symbols)
+
+    def backfill(self, symbols: list[str]) -> None:
+        """回填模式。"""
+        logger.info(f"本地 Parquet 数据源就绪，共 {len(symbols)} 只标的，无需网络拉取。")
+

@@ -9,11 +9,17 @@ class Settings(BaseSettings):
     feishu_webhook_url: str  # 必填字段，缺失时抛出 ValidationError
     strategy_webhooks: dict[str, str] = {}
 
+    # 数据源配置（Parquet / Postgres）
+    parquet_dir: str = "/home/aki/python/backtest/data/candles"
+    factors_path: str = "/home/aki/python/backtest/data/factors/adjustment_factors.parquet"
+    db_config_path: str = "/home/aki/python/database.ini"
+    pg_section: str = "stock"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="ignore",  # <--- 加上这一行！让 Pydantic 放行未定义的变量
+        extra="ignore",
     )
 
     @classmethod
